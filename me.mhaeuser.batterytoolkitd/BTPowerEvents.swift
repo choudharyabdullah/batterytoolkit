@@ -16,6 +16,30 @@ internal enum BTPowerEvents {
 
     private static var powerCreated = false
     private static var percentCreated = false
+    private static var firmwareTimer: DispatchSourceTimer?
+    private static var firmwareStopUpper: UInt8?
+    private static var firmwareWasConnected: Bool?
+    // Set once charge fell below minCharge; the firmware then charges up to
+    // maxCharge, like the legacy switch did, even across wake or settings.
+    private static var firmwareResumed = false
+
+    static var sustainedCharge: UInt8? {
+        guard let upper = self.firmwareSustainUpper,
+              let installed = SMCComm.Power.firmwareChargeLimit(),
+              installed.active, installed.upper == upper else {
+            return nil
+        }
+        return upper
+    }
+
+    private static var firmwareSustainUpper: UInt8? {
+        guard SMCComm.Power.usesFirmwareChargeLimit,
+              self.chargingMode == .standard,
+              let upper = self.firmwareStopUpper, upper > BTSettings.maxCharge else {
+            return nil
+        }
+        return upper
+    }
 
     static func start() throws {
         let smcSuccess = SMCComm.start()
@@ -30,10 +54,37 @@ internal enum BTPowerEvents {
             throw BTError.unsupported
         }
 
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            os_log("Using firmware charging limits")
+            self.firmwareWasConnected = nil
+            self.firmwareResumed = false
+            guard self.updateFirmwareChargeLimit(restoreInstalledSustain: true) else {
+                SMCComm.stop()
+                throw BTError.unknown
+            }
+        }
+
         let registerSuccess = self.registerLimitedPowerHandler()
         guard registerSuccess else {
+            self.restoreState()
             SMCComm.stop()
             throw BTError.unknown
+        }
+
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            // Repair limits reset by firmware or another power-management client.
+            // This timer does not wake a sleeping Mac; the firmware enforces the
+            // range while asleep. Wake notifications reapply it immediately.
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(deadline: .now() + 30, repeating: 30, leeway: .seconds(5))
+            timer.setEventHandler {
+                MainActor.assumeIsolated {
+                    guard self.powerCreated else { return }
+                    self.handleLimitedPower()
+                }
+            }
+            timer.resume()
+            self.firmwareTimer = timer
         }
     }
 
@@ -63,6 +114,8 @@ internal enum BTPowerEvents {
     static func stop() {
         assert(self.powerCreated)
 
+        self.firmwareTimer?.cancel()
+        self.firmwareTimer = nil
         self.unregisterLimitedPowerHandler()
         self.unregisterPercentChangedHandler()
         self.restoreState()
@@ -70,13 +123,18 @@ internal enum BTPowerEvents {
     }
 
     static func wakeFromSleep() {
+        assert(self.powerCreated)
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            self.firmwareWasConnected = nil
+            BTPowerState.refreshState()
+            self.handleLimitedPowerGuarded()
+            return
+        }
         //
         // Immediately disable sleep to not interrupt the setup phase.
         //
         GlobalSleep.disable()
         
-        assert(self.powerCreated)
-
         BTPowerState.refreshState()
 
         if self.percentCreated {
@@ -91,6 +149,8 @@ internal enum BTPowerEvents {
     }
 
     static func settingsChanged() {
+        self.firmwareStopUpper = nil
+        self.firmwareWasConnected = nil
         guard self.percentCreated else {
             return
         }
@@ -99,11 +159,27 @@ internal enum BTPowerEvents {
     }
 
     static func chargeToLimit() -> Bool {
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            guard let (percent, _, _) = IOPSPrivate.GetPercentRemaining() else {
+                return false
+            }
+            if percent >= BTSettings.maxCharge {
+                return self.setFirmwareMode(.standard, stopUpper: percent)
+            }
+            return self.setFirmwareMode(.toLimit)
+        }
         self.chargingMode = .toLimit
         return self.enableBelowLimitMode(limit: BTSettings.maxCharge)
     }
 
     static func disableCharging(percent: UInt8) -> Bool {
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            // Keep this target fixed while paused, rather than following each
+            // falling percentage and inadvertently forcing continued discharge.
+            return self.setFirmwareMode(
+                .standard, stopUpper: max(1, percent)
+            )
+        }
         self.chargingMode = .standard
         return BTPowerState.disableCharging(percent: percent)
     }
@@ -114,6 +190,9 @@ internal enum BTPowerEvents {
     }
 
     static func chargeToFull() -> Bool {
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            return self.setFirmwareMode(.toFull)
+        }
         self.chargingMode = .toFull
         return self.enableBelowLimitMode(limit: 100)
     }
@@ -203,6 +282,9 @@ internal enum BTPowerEvents {
         }
 
         let percent = self.handleChargeHysteresis()
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            return true
+        }
         //
         // In case charging to limit or full were requested while the device
         // was on battery, enable it now if appropriate.
@@ -239,6 +321,13 @@ internal enum BTPowerEvents {
 
         guard let (percent, _, _) = IOPSPrivate.GetPercentRemaining() else {
             return 100
+        }
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            if !self.updateFirmwareChargeLimit() {
+                os_log("Failed to apply firmware charging limits")
+            }
+            BTPowerState.refreshState()
+            return percent
         }
         //
         // The hysteresis does not apply when starting the daemon, as
@@ -279,6 +368,16 @@ internal enum BTPowerEvents {
         let unlimitedPower = self.drawingUnlimitedPower()
         self.unlimitedPower = unlimitedPower
 
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            // Keep the range installed on battery too. Firmware can temporarily
+            // report battery power above the limit, and unplug/replug must not
+            // turn a 30–80% range into a new charging session.
+            if !self.registerPercentChangedHandler() {
+                os_log("Failed to register percent changed handler")
+            }
+            return
+        }
+
         if unlimitedPower {
             let success = self.registerPercentChangedHandler()
             if !success {
@@ -296,6 +395,10 @@ internal enum BTPowerEvents {
     }
 
     private static func handleLimitedPower() {
+        if SMCComm.Power.usesFirmwareChargeLimit {
+            self.handleLimitedPowerGuarded()
+            return
+        }
         //
         // Immediately disable sleep to not interrupt the setup phase.
         //
@@ -314,8 +417,14 @@ internal enum BTPowerEvents {
         // of development machines.
         //
         #if !DEBUG
-            let (percent, _, _) = BTPowerState.getPercentRemaining()
-            _ = BTPowerState.enableCharging(percent: percent)
+            if SMCComm.Power.usesFirmwareChargeLimit {
+                // An active range can currently be charging. Always clear it,
+                // regardless of the cached chargingDisabled flag.
+                _ = SMCComm.Power.clearFirmwareChargeLimit()
+            } else {
+                let (percent, _, _) = BTPowerState.getPercentRemaining()
+                _ = BTPowerState.enableCharging(percent: percent)
+            }
             _ = BTPowerState.enablePowerAdapter()
         #endif
         if BTSettings.magSafeSync {
@@ -343,5 +452,101 @@ internal enum BTPowerEvents {
         }
 
         return true
+    }
+
+    private static func setFirmwareMode(
+        _ mode: BTStateInfo.ChargingMode, stopUpper: UInt8? = nil
+    ) -> Bool {
+        let previousMode = self.chargingMode
+        let previousStopUpper = self.firmwareStopUpper
+        let previousConnection = self.firmwareWasConnected
+        self.chargingMode = mode
+        self.firmwareStopUpper = stopUpper
+        guard self.updateFirmwareChargeLimit(resumeBelowMinimum: stopUpper == nil) else {
+            self.chargingMode = previousMode
+            self.firmwareStopUpper = previousStopUpper
+            self.firmwareWasConnected = previousConnection
+            return false
+        }
+        BTPowerState.refreshState()
+        return true
+    }
+
+    private static func updateFirmwareChargeLimit(
+        resumeBelowMinimum: Bool = true, restoreInstalledSustain: Bool = false
+    ) -> Bool {
+        guard let (percent, _, _) = IOPSPrivate.GetPercentRemaining() else {
+            // Leave the last verified range in place when a reading is missing.
+            return false
+        }
+
+        let connected = self.drawingUnlimitedPower()
+        let replugged = connected && self.firmwareWasConnected == false
+        let startingSession = self.firmwareWasConnected == nil || replugged
+        self.firmwareWasConnected = connected
+        if replugged || self.chargingMode != .standard ||
+            self.firmwareStopUpper != nil || percent >= BTSettings.maxCharge {
+            // The legacy app disabled charging on replug, and a charge that
+            // resumed below minCharge ends at maxCharge.
+            self.firmwareResumed = false
+        }
+
+        if self.chargingMode == .standard && startingSession && !self.firmwareResumed &&
+            percent >= BTSettings.minCharge {
+            // The legacy charging switch never started charging above
+            // minCharge, and stopped at the current level without draining to
+            // maxCharge. The firmware, however, charges towards the upper bound
+            // whenever a range is (re)installed. Approximate the switch with a
+            // ceiling at the current level, captured on start, wake, replug, or
+            // a settings change. Never raise it on ordinary percentage events:
+            // that would chase an overshoot.
+            var upper = percent
+            if let previous = self.firmwareStopUpper {
+                upper = min(upper, previous)
+            }
+            if restoreInstalledSustain, let installed = SMCComm.Power.firmwareChargeLimit(),
+               installed.active, installed.upper >= BTSettings.minCharge,
+               installed.upper > BTSettings.maxCharge || percent <= BTSettings.maxCharge {
+                // Preserve a hold across daemon updates/restarts as well.
+                upper = min(upper, installed.upper)
+            }
+            self.firmwareStopUpper = upper
+        }
+
+        if !connected, let upper = self.firmwareSustainUpper, percent < upper {
+            // Follow natural battery use down while unplugged, so reconnecting
+            // does not request a return to the earlier, higher percentage.
+            self.firmwareStopUpper = percent
+        }
+
+        if self.chargingMode == .toFull {
+            if percent < 100 {
+                return SMCComm.Power.clearFirmwareChargeLimit()
+            }
+            // Completing a requested full charge must not immediately drain the
+            // battery back to maxCharge. Keep 100% until it naturally falls into
+            // the standard range, e.g. after unplugging.
+            self.firmwareStopUpper = 100
+        }
+        if percent >= BTSettings.maxCharge {
+            self.chargingMode = .standard
+        }
+        if resumeBelowMinimum && percent < BTSettings.minCharge {
+            self.firmwareStopUpper = nil
+            if self.chargingMode == .standard {
+                self.firmwareResumed = true
+            }
+        }
+        if let stopUpper = self.firmwareStopUpper,
+           stopUpper > BTSettings.maxCharge, percent <= BTSettings.maxCharge {
+            // Keep holding the current level rather than topping up to
+            // maxCharge once an above-limit hold has been used up.
+            self.firmwareStopUpper = percent < BTSettings.maxCharge ? percent : nil
+        }
+
+        let upper = self.firmwareStopUpper ?? BTSettings.maxCharge
+        let lower = self.chargingMode == .toLimit ? upper - 1 :
+            min(BTSettings.minCharge, upper - 1)
+        return SMCComm.Power.setFirmwareChargeLimit(lower: lower, upper: upper)
     }
 }

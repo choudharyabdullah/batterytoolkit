@@ -1,2 +1,7 @@
 Battery Toolkit.xcodeproj/xcuserdata/
 Battery Toolkit.xcodeproj/project.xcworkspace/xcuserdata/
+build/no-xcode/base/
+build/no-xcode/bin/
+build/no-xcode/obj/
+build/no-xcode/log/
+build/no-xcode/mcache/

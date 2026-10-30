@@ -104,7 +104,19 @@ If you want to change any settings, simply re-open the app.
 3. Choose "Disable Background Activity"
 4. Move the app to the Trash and empty it
 
+# Building without Xcode
+
+`Tools/build-without-xcode.sh` builds the app with only the Command Line Tools. It compiles the Swift sources, reuses the compiled storyboards and asset catalog of the official 1.8 release (the UI sources are unchanged since), and signs the result with a self-signed certificate that the daemon trusts through the `BT_CODESIGN_CERT_SHA1` pin. The identity is created on first run in `~/.batterytoolkit-signing`. Builds made this way are not notarized and only trust each other, which is sufficient for a local installation.
+
 # Limitations
+
+## Newer firmware (macOS 15.8 / 26.7 and later)
+
+Newer firmware removes the SMC keys that switch charging on and off. On these Macs, Battery Toolkit instead programs the firmware's own charge range (lower and upper limit), which the firmware enforces while the Mac runs from the power adapter and also while it sleeps. In this mode:
+* The displayed charge level may drift by a percent or so around the limit while the firmware settles.
+* Sleep is not disabled while charging, as the firmware enforces the limit on its own.
+* The range does not survive a shutdown. A Mac that is shut down with the adapter connected charges to 100&nbsp;%.
+* macOS 27 restricts these keys as well, even for root, so this mode does not work there.
 
 Battery Toolkit disables sleep while it is charging, because it has to actively disable charging once reaching the maximum. Sleep is re-enabled once charging is stopped for any reason, e.g., reaching the maximum charge level, manual cancellation, or unplugging the MacBook.
 

@@ -149,10 +149,26 @@ internal enum BTXPCValidation {
     }
 
     private static func requirementsTextFromId(identifier: String) -> String {
+        //
+        // Independently signed builds pin one exact certificate instead of
+        // requiring an Apple-issued one. Reject malformed pins rather than
+        // weakening the requirement.
+        //
+        let certificatePin = BT_CODESIGN_CERT_SHA1 as String
+        let signerText: String
+        if certificatePin.isEmpty {
+            signerText = " and anchor apple generic" +
+                " and certificate leaf[subject.CN] = \"" + BT_CODESIGN_CN + "\"" +
+                " and certificate 1[field.1.2.840.113635.100.6.2.1] /* exists */"
+        } else {
+            guard certificatePin.count == 40,
+                  certificatePin.allSatisfy({ $0.isHexDigit }) else {
+                return "never"
+            }
+            signerText = " and certificate leaf = H\"" + certificatePin + "\""
+        }
         let debugText = "identifier \"" + identifier + "\"" +
-            " and anchor apple generic" +
-            " and certificate leaf[subject.CN] = \"" + BT_CODESIGN_CN + "\"" +
-            " and certificate 1[field.1.2.840.113635.100.6.2.1] /* exists */" +
+            signerText +
             " and !(entitlement[\"com.apple.security.cs.allow-dyld-environment-variables\"] /* exists */)" +
             " and !(entitlement[\"com.apple.security.cs.disable-library-validation\"] /* exists */)" +
             " and !(entitlement[\"com.apple.security.cs.allow-unsigned-executable-memory\"] /* exists */)" +

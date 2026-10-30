@@ -28,6 +28,10 @@ extern const NSString *const BT_AUTOSTART_ID;
 /// The Battery Toolkit codesign Common Name.
 extern const NSString *const BT_CODESIGN_CN;
 
+/// The Battery Toolkit codesign certificate SHA-1 pin for independently
+/// signed builds. Empty for Apple-issued certificates.
+extern const NSString *const BT_CODESIGN_CERT_SHA1;
+
 __END_DECLS
 
 #endif
